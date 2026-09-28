@@ -174,6 +174,9 @@ def ocr_lines(screen: Screen, cache: OcrCache | None = None) -> tuple[list[Line]
     whole region is cheaper than stitching. A line a re-read rectangle touches is dropped and read
     again whole, because Vision segments a crop slightly differently from the full image.
     """
+    tree = tree_text(screen)
+    if tree is not None:
+        return tree, 0.0, 0
     region = ocr_region(screen)
     area = float(max(1, screen.image.width * screen.image.height))
 
@@ -200,6 +203,18 @@ def ocr_lines(screen: Screen, cache: OcrCache | None = None) -> tuple[list[Line]
     lines = merge_reocr(cache.lines, fresh, rects)
     cache.store(screen, region, thumb, lines)
     return lines, read_pct(rects), len(rects)
+
+
+def tree_text(screen: Screen) -> list[Line] | None:
+    """The screen's text from the adapter's accessibility tree instead of OCR, when it offers that.
+
+    Optional: an adapter without `text_lines`, or one that returns None because its tree is thin,
+    leaves OCR to read the pixels. Never on a replay, whose capture is not the live screen.
+    """
+    if screen.pid is None:
+        return None
+    read = getattr(desktop, "text_lines", None)
+    return read(screen) if callable(read) else None
 
 
 def _read_region(screen: Screen, region: Box, thumb: Image.Image, cache: OcrCache) -> list[Line]:

@@ -48,6 +48,7 @@ Issues = "https://github.com/awlevin/typesafe-computer-use/issues"
 clicker = "typesafe_computer_use.cli:main"
 clicker-inspect = "typesafe_computer_use.cli:inspect"
 clicker-bench = "typesafe_computer_use.browser.bench:main"
+clicker-hypr = "typesafe_computer_use.hyprland.cli:main"
 
 [dependency-groups]
 dev = ["pytest==9.1.1", "ruff==0.16.8"]
