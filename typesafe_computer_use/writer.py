@@ -13,6 +13,7 @@ import anthropic
 import openai
 from PIL import Image
 
+from .claude_code_writer import ClaudeCodeError, ClaudeCodeWriter
 from .config import (
     answer_model,
     answer_reasoning,
@@ -31,7 +32,7 @@ ANSWER_IMAGE_EDGE = 1568  # the longest edge a vision model reads without shrink
 PLACEHOLDER_KEY = "not-needed"  # an endpoint you host yourself does not check a key
 
 
-type Writer = anthropic.Anthropic | OpenAIWriter  # both answer `messages.create` the Anthropic way
+type Writer = anthropic.Anthropic | OpenAIWriter | ClaudeCodeWriter  # all answer `messages.create` the Anthropic way
 
 
 class WriterError(Exception):
@@ -47,6 +48,8 @@ def make_writer() -> Writer | None:
     ANTHROPIC_* key, token, and base URL as it always does. An endpoint that speaks OpenAI's API
     (CLICKER_WRITER_API=openai) has no default to fall back on, so it must be named.
     """
+    if writer_api() == "claude-code":
+        return ClaudeCodeWriter()
     base_url = writer_base_url()
     key = os.environ.get("CLICKER_WRITER_API_KEY") or PLACEHOLDER_KEY
     if writer_api() == "openai":
@@ -107,7 +110,7 @@ def _structured(
             output_config={"format": {"type": "json_schema", "schema": schema}},
             **extra,
         )
-    except (anthropic.APIError, openai.APIError) as e:
+    except (anthropic.APIError, openai.APIError, ClaudeCodeError) as e:
         raise WriterError(f"the request failed: {e}") from e
     return checked(parse_json("".join(b.text for b in response.content if b.type == "text")), properties)
 
