@@ -22,13 +22,17 @@ unchanged.
 import base64
 import glob
 import json
+import math
 import os
 import shlex
+import socket
 import subprocess
 import sys
+import threading
 import time
 import warnings
 import xml.etree.ElementTree as ET
+from collections import deque
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)  # Atspi marks the static interface calls too
 
@@ -72,10 +76,145 @@ def _discover_session():
         pass
 
 
-_discover_session()
+def stop_file():
+    """The panic switch: anything that creates this file (a keybind) stops the run at its next check."""
+    return os.path.join(os.environ["XDG_RUNTIME_DIR"], "jev-stop")
 
-# The panic switch: anything that creates this file (a keybind) stops the run at its next check.
-STOP_FILE = os.path.join(os.environ["XDG_RUNTIME_DIR"], "jev-stop")
+
+# ------------------------------------------------------------------ owner takeover
+
+TAKEOVER_PX = float(os.environ.get("JEV_TAKEOVER_PX") or 64)  # cursor drift that means a hand is on the mouse
+SETTLE_SECONDS = 0.4  # after jev's own input, its echoes (cursor, focus, its own Escape) are not the owner's
+ESC_SMASH = 3  # this many Escapes ...
+ESC_WINDOW = 1.5  # ... within this many seconds
+ESC_EVENT = "jev-esc"  # the custom>> event a non-consuming Escape bind emits
+
+
+class Takeover:
+    """Whether the owner has taken the seat back, judged from what jev can see over Hyprland's IPC.
+
+    Pure bookkeeping, fed by the watcher threads and the input ops; the clock is injectable so
+    the rules are testable. The first reason latches, and every later input is refused until the
+    next run's `baseline`.
+
+    - The cursor more than TAKEOVER_PX from where jev last left it: a hand moved the mouse.
+    - Focus moving to another monitor: the owner clicked or switched workspace elsewhere.
+    - ESC_SMASH Escapes within ESC_WINDOW: Hyprland never streams keys, so a non-consuming Escape
+      bind emits a custom event for each press; one Escape is ordinary use, a burst is a signal.
+
+    While jev's own input runs, and for SETTLE_SECONDS after it, observations are jev's own echo.
+    """
+
+    def __init__(self, tolerance=TAKEOVER_PX, clock=time.monotonic):
+        self.tolerance = tolerance
+        self.clock = clock
+        self.lock = threading.Lock()
+        self.expected = None
+        self.busy = 0
+        self.quiet_until = 0.0
+        self.reason = None
+        self.escapes = deque()
+
+    def _echo(self):
+        return self.busy > 0 or self.clock() < self.quiet_until
+
+    def _latch(self, reason):
+        if self.reason is None:
+            self.reason = reason
+
+    def baseline(self, cursor):
+        with self.lock:
+            self.expected, self.reason, self.busy, self.quiet_until = cursor, None, 0, 0.0
+            self.escapes.clear()
+
+    def begin(self):
+        with self.lock:
+            self.busy += 1
+
+    def end(self, cursor):
+        with self.lock:
+            self.busy = max(0, self.busy - 1)
+            if cursor is not None:
+                self.expected = cursor
+            self.quiet_until = self.clock() + SETTLE_SECONDS
+
+    def cursor_seen(self, pos):
+        with self.lock:
+            if self._echo() or self.expected is None or pos is None:
+                return
+            drift = math.dist(pos, self.expected)
+            if drift > self.tolerance:
+                self._latch(f"owner took over: mouse moved {drift:.0f}px from where jev left it")
+
+    def escape(self):
+        with self.lock:
+            now = self.clock()
+            if self._echo():
+                return  # jev's own press_escape
+            self.escapes.append(now)
+            while self.escapes and now - self.escapes[0] > ESC_WINDOW:
+                self.escapes.popleft()
+            if len(self.escapes) >= ESC_SMASH:
+                self._latch(f"owner took over: Escape pressed {len(self.escapes)} times")
+
+    def focused_monitor(self, name, jevs):
+        with self.lock:
+            if name != jevs and not self._echo():
+                self._latch(f"owner took over: focus moved to {name}")
+
+
+TAKEOVER = Takeover()
+
+
+def _hypr_socket(name):
+    return os.path.join(os.environ["XDG_RUNTIME_DIR"], "hypr", os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", ""), name)
+
+
+def hypr_request(command):
+    """One request over Hyprland's socket, no hyprctl process: cheap enough to poll."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(2)
+        s.connect(_hypr_socket(".socket.sock"))
+        s.sendall(command.encode())
+        chunks = []
+        while data := s.recv(65536):
+            chunks.append(data)
+    return json.loads(b"".join(chunks))
+
+
+def _watch_cursor():
+    while True:
+        try:
+            pos = hypr_request("j/cursorpos")
+            TAKEOVER.cursor_seen((pos["x"], pos["y"]))
+        except (OSError, ValueError, KeyError):
+            pass
+        time.sleep(0.1)
+
+
+def _watch_events():
+    while True:
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.connect(_hypr_socket(".socket2.sock"))
+                for raw in s.makefile("r", encoding="utf-8", errors="replace"):
+                    event, _, data = raw.rstrip("\n").partition(">>")
+                    if event == "custom" and data == ESC_EVENT:
+                        TAKEOVER.escape()
+                    elif event == "focusedmon" and MONITOR:
+                        TAKEOVER.focused_monitor(data.split(",")[0], MONITOR["name"])
+        except OSError:
+            time.sleep(1)
+
+
+_WATCHING = []
+
+
+def start_watchers():
+    if not _WATCHING:
+        for target in (_watch_cursor, _watch_events):
+            threading.Thread(target=target, daemon=True).start()
+        _WATCHING.append(True)
 
 
 def run(argv, stdin=None, timeout=30):
@@ -150,9 +289,13 @@ def active_window():
     }
 
 
+def global_cursor():
+    pos = hypr_request("j/cursorpos")
+    return (pos["x"], pos["y"])
+
+
 def cursor():
-    pos = hyprctl("cursorpos")
-    return list(to_local(pos["x"], pos["y"]))
+    return list(to_local(*global_cursor()))
 
 
 # ------------------------------------------------------------------ accessibility tree
@@ -296,13 +439,16 @@ def tree():
 
 
 def op_hello(monitor=None):
-    if os.path.exists(STOP_FILE):
-        os.remove(STOP_FILE)  # a press from an earlier run does not stop this one
-    return {"monitor": select_monitor(monitor), "atspi": ATSPI}
+    if os.path.exists(stop_file()):
+        os.remove(stop_file())  # a press from an earlier run does not stop this one
+    picked = select_monitor(monitor)
+    TAKEOVER.baseline(global_cursor())
+    start_watchers()
+    return {"monitor": picked, "atspi": ATSPI}
 
 
 def op_state():
-    return {"window": active_window(), "cursor": cursor(), "stop": os.path.exists(STOP_FILE)}
+    return {"window": active_window(), "cursor": cursor(), "stop": os.path.exists(stop_file()), "takeover": TAKEOVER.reason}
 
 
 def op_screenshot():
@@ -375,15 +521,34 @@ def op_spawn(argv):
 
 
 OPS = {name[3:]: fn for name, fn in globals().items() if name.startswith("op_")}
+# Ops that put input on the seat: refused once the owner took over, and their echoes are jev's own.
+INPUT_OPS = {"click", "move", "scroll", "key", "type", "focus", "bring", "launch", "spawn"}
+
+
+def handle(req):
+    op = req.pop("op")
+    if op not in INPUT_OPS:
+        return OPS[op](**req)
+    if TAKEOVER.reason:
+        raise RuntimeError(f"refused: {TAKEOVER.reason}")
+    TAKEOVER.begin()
+    try:
+        return OPS[op](**req)
+    finally:
+        try:
+            where = global_cursor()
+        except (OSError, ValueError, KeyError):
+            where = None
+        TAKEOVER.end(where)
 
 
 def main():
+    _discover_session()
     for line in sys.stdin:
         if not line.strip():
             continue
         try:
-            req = json.loads(line)
-            reply = {"ok": True, **OPS[req.pop("op")](**req)}
+            reply = {"ok": True, **handle(json.loads(line))}
         except Exception as exc:
             reply = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         sys.stdout.write(json.dumps(reply) + "\n")

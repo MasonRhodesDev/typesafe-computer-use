@@ -113,7 +113,12 @@ class HyprlandDesktop:
 
     def _input(self, op: str, **args) -> dict:
         self._obs = None  # anything read before this input is stale after it
-        return self._call(op, **args)
+        try:
+            return self._call(op, **args)
+        except RemoteError as e:
+            if "owner took over" in str(e):
+                raise Abort(str(e).split("refused: ", 1)[-1]) from e
+            raise
 
     def _now(self) -> dict:
         """The window and the tree as they are now, fetched once per observation."""
@@ -135,12 +140,17 @@ class HyprlandDesktop:
         state = self._call("state")
         if state["stop"]:
             raise Abort(f"panic key on {self.host}")
+        if state.get("takeover"):
+            raise Abort(state["takeover"])
         x, y = state["cursor"]
         if 0 <= x <= ABORT_CORNER_PX and 0 <= y <= ABORT_CORNER_PX:
             raise Abort(f"mouse in the top-left corner of {self.monitor['name']}")
 
     def abort_hint(self) -> str:
-        return f"Ctrl-C here, the panic key (SUPER+SHIFT+BackSpace) on {self.host}, or the mouse in {self.monitor['name']}'s top-left corner"
+        return (
+            f"take the seat on {self.host}: move the mouse, focus another monitor, or smash Escape; "
+            "or the panic key (SUPER+SHIFT+BackSpace), or Ctrl-C here"
+        )
 
     def sleep_watching(self, seconds: float) -> None:
         self._obs = None  # the screen moves on while we wait
