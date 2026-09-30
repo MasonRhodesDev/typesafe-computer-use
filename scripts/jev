@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# jev: TypeSafe computer use driving a Hyprland desktop over ssh through hyprhands.
+#
+#   jev "goal"                 dry run: one step, prints the decision, touches nothing
+#   jev "goal" --act           drives the desktop (add --steps N to bound it)
+#   jev --inspect "goal"       capture + the exact payload jev would send
+#
+# Runs from the repo so its .env loads; each run gets runs/<timestamp>/ unless --out is given.
+# Host and monitor: JEV_HYPR_HOST (mason-desktop), JEV_HYPR_MONITOR (HDMI-A-1).
+# Stop a run: move the mouse or focus another monitor there, `hyprhands stop` there, or Ctrl-C here.
+# Installed by scripts/install-jev, which links this file into ~/.local/bin.
+set -euo pipefail
+REPO="${JEV_REPO:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+cd "$REPO"
+export JEV_HYPR_HOST="${JEV_HYPR_HOST:-mason-desktop}"
+export JEV_HYPR_MONITOR="${JEV_HYPR_MONITOR:-HDMI-A-1}"
+# Writer: this box's Claude Code sign-in (`claude -p`) unless an API key or another endpoint is set.
+if [[ -z "${ANTHROPIC_API_KEY:-}" && -z "${CLICKER_WRITER_BASE_URL:-}" ]] && ! grep -qsE '^(ANTHROPIC_API_KEY|CLICKER_WRITER_BASE_URL)=.+' .env; then
+  export CLICKER_WRITER_API="${CLICKER_WRITER_API:-claude-code}"
+fi
+args=("$@")
+if [[ " ${args[*]-} " != *" --out "* ]]; then
+  out="runs/$(date +%Y%m%d-%H%M%S)"
+  args+=(--out "$out")
+  echo "run folder: $REPO/$out" >&2
+fi
+exec "$REPO/.venv/bin/clicker-hypr" "${args[@]}"

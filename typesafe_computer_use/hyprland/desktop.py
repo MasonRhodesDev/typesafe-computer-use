@@ -42,8 +42,9 @@ from ..platform_adapter import OcrLine
 ABORT_POLL_SECONDS = 0.25
 SCROLL_LINES_PER_NOTCH = 3  # jev scrolls in lines (a Mac wheel unit); a wheel notch is about three
 LAUNCH_SETTLE_SECONDS = 1.0
-# Where hyprhands is on the Hyprland machine: a non-interactive ssh login's PATH leaves out
-# ~/.local/bin, so it is tried first. JEV_HYPRHANDS names another path.
+# Where hyprhands is on the Hyprland machine: on PATH (its package installs /usr/bin/hyprhands),
+# else ~/.local/bin, which a non-interactive ssh login's PATH leaves out. JEV_HYPRHANDS names
+# another path.
 HYPRHANDS = os.environ.get("JEV_HYPRHANDS")
 MAX_FRAME = 64 << 20
 
@@ -106,7 +107,7 @@ def serve_command(monitor: str | None) -> str:
     args = " serve" + (f" --monitor {shlex.quote(monitor)}" if monitor else "")
     if HYPRHANDS:
         return f"exec {shlex.quote(HYPRHANDS)}{args}"
-    return f'h="$HOME/.local/bin/hyprhands"; [ -x "$h" ] || h=hyprhands; exec "$h"{args}'
+    return f'h="$(command -v hyprhands || echo "$HOME/.local/bin/hyprhands")"; exec "$h"{args}'
 
 
 def _refusal(message: str) -> str | None:

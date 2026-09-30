@@ -39,7 +39,8 @@ def test_a_blob_follows_its_header_and_the_next_reply_follows_the_blob():
 def test_the_serve_command_finds_hyprhands_outside_a_login_path(monkeypatch):
     monkeypatch.setattr(hypr, "HYPRHANDS", None)
     cmd = hypr.serve_command("HDMI-A-1")
-    assert '$HOME/.local/bin/hyprhands' in cmd and cmd.endswith('exec "$h" serve --monitor HDMI-A-1')
+    assert cmd.startswith('h="$(command -v hyprhands || echo "$HOME/.local/bin/hyprhands")"')
+    assert cmd.endswith('exec "$h" serve --monitor HDMI-A-1')
     monkeypatch.setattr(hypr, "HYPRHANDS", "/opt/hh")
     assert hypr.serve_command(None) == "exec /opt/hh serve"
 

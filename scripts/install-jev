@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Set up jev on this machine: the repo's venv with the Hyprland extra (editable, so the checkout is
+# what runs), and `jev` on PATH. The desktop side is the hyprhands package there.
+set -euo pipefail
+REPO="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+PY="${PYTHON:-python3}"
+[[ -x "$REPO/.venv/bin/python" ]] || "$PY" -m venv "$REPO/.venv"
+"$REPO/.venv/bin/python" -m pip install -q --upgrade pip
+"$REPO/.venv/bin/python" -m pip install -q -e "$REPO[hyprland]"
+mkdir -p "$HOME/.local/bin"
+ln -sfn "$REPO/scripts/jev" "$HOME/.local/bin/jev"
+echo "jev -> $(readlink -f "$HOME/.local/bin/jev")"
+host="${JEV_HYPR_HOST:-mason-desktop}"
+if ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" 'command -v hyprhands >/dev/null && hyprhands doctor' ; then
+  echo "hyprhands ready on $host"
+else
+  echo "hyprhands is not installed on $host: build its packaging/arch/PKGBUILD there" >&2
+fi
