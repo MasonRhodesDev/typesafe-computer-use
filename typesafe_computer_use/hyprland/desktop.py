@@ -1,31 +1,36 @@
 """The `Desktop` surface over ssh to a Hyprland machine, so jev's loop drives it unchanged.
 
-jev runs here, with its keys; the screen, the mouse and the keyboard are on another machine. One
-ssh session carries `remote.py` there and then its JSON-lines requests: a capture with `grim`, the
-active window from `hyprctl`, the active app's accessibility tree through AT-SPI, and every input
-through `hypruse`. OCR runs here, on RapidOCR, the same backend the OSWorld runs use on Linux.
+jev runs here, with its keys; the screen, the mouse and the keyboard are on another machine, where
+`hyprhands serve` (https://github.com/MasonRhodesDev/hyprhands, installed there) holds one session
+for the whole run. It speaks framed JSON on stdio, so it rides the ssh session unchanged: captures
+come back as raw QOI bytes, the active window's accessibility tree as the OSWorld XML jev's
+`osworld/a11y.py` reads, and the screen's text from that tree when there is enough of it. OCR runs
+here, on RapidOCR, only when there is not.
 
 jev knows one display with its origin at 0,0. That is one monitor of the Hyprland machine, the
-focused one unless named, and `remote.py` does the translation both ways, so every coordinate on
+focused one unless named, and hyprhands does the translation both ways, so every coordinate on
 this side is in that monitor's logical space.
 
 Reads are cached per observation, as in `osworld/desktop.py`: the first read after an input
 fetches the window and the tree once, and every read up to the next input reuses them.
 
-Nothing can be pressed through the tree from here (AT-SPI objects do not cross ssh), so the
-`ax_*` actions refuse and every click is a real pointer click, delivered by hypruse.
+hyprhands watches for the owner taking the seat back (the cursor moving off where it left it, or
+focus leaving the monitor) and refuses input from then on; that refusal ends the run as an Abort.
+Nothing is pressed through the tree yet, so the `ax_*` actions refuse and every click is a real
+pointer click.
 """
 
 from __future__ import annotations
 
-import base64
 import json
+import os
 import shlex
+import struct
 import subprocess
 import time
 import xml.etree.ElementTree as ET
-from io import BytesIO
 from pathlib import Path
+from typing import BinaryIO
 
 from PIL import Image
 
@@ -33,25 +38,29 @@ from ..config import ABORT_CORNER_PX
 from ..models import Abort, AxNode, Field
 from ..osworld import a11y
 from ..platform_adapter import OcrLine
-from . import tree_text
 
-REMOTE_SCRIPT = Path(__file__).with_name("remote.py")
 ABORT_POLL_SECONDS = 0.25
 SCROLL_LINES_PER_NOTCH = 3  # jev scrolls in lines (a Mac wheel unit); a wheel notch is about three
 LAUNCH_SETTLE_SECONDS = 1.0
+# Where hyprhands is on the Hyprland machine: a non-interactive ssh login's PATH leaves out
+# ~/.local/bin, so it is tried first. JEV_HYPRHANDS names another path.
+HYPRHANDS = os.environ.get("JEV_HYPRHANDS")
+MAX_FRAME = 64 << 20
 
 # Window classes onto the app names jev compares with CLICKER_BROWSER, and back.
 APP_NAMES = {"google-chrome": "Google Chrome", "chromium": "Chromium"}
 APP_CLASSES = {name: klass for klass, name in APP_NAMES.items()}
 
-# The browser jev drives: its own profile, never the owner's logins, with the accessibility tree
-# on (Chromium exposes none to AT-SPI without the flag).
+# The browser jev drives: the owner's own, logins and all (a URL opens as a new tab in the running
+# instance), unless JEV_BROWSER_PROFILE names a separate profile directory on the Hyprland machine.
+# A browser jev starts gets its accessibility tree on (Chromium exposes none to AT-SPI without the
+# flag unless an assistive technology asked for it).
 BROWSER_ARGV = {
     "Google Chrome": ["google-chrome-stable"],
     "Chromium": ["chromium"],
 }
 BROWSER_FLAGS = [
-    "--user-data-dir=$HOME/.cache/jev-browser",
+    *([f"--user-data-dir={os.environ['JEV_BROWSER_PROFILE']}"] if os.environ.get("JEV_BROWSER_PROFILE") else []),
     "--force-renderer-accessibility",
     "--no-first-run",
     "--no-default-browser-check",
@@ -65,24 +74,66 @@ class RemoteError(RuntimeError):
     """The Hyprland machine refused or failed a request."""
 
 
+def write_request(w: BinaryIO, req: dict) -> None:
+    """One request: a u32 big-endian length, then that much JSON."""
+    body = json.dumps(req).encode()
+    w.write(struct.pack(">I", len(body)) + body)
+    w.flush()
+
+
+def _read_exact(r: BinaryIO, n: int) -> bytes:
+    out = b""
+    while len(out) < n:
+        chunk = r.read(n - len(out))
+        if not chunk:
+            raise EOFError
+        out += chunk
+    return out
+
+
+def read_reply(r: BinaryIO) -> tuple[dict, bytes | None]:
+    """One reply: a length-prefixed JSON header, then exactly `blob` raw bytes when it names some."""
+    (n,) = struct.unpack(">I", _read_exact(r, 4))
+    if n > MAX_FRAME:
+        raise RemoteError(f"a {n}-byte reply header is not hyprhands talking")
+    header = json.loads(_read_exact(r, n))
+    blob = _read_exact(r, header["blob"]) if "blob" in header else None
+    return header, blob
+
+
+def serve_command(monitor: str | None) -> str:
+    """The shell command that starts hyprhands' session on the Hyprland machine."""
+    args = " serve" + (f" --monitor {shlex.quote(monitor)}" if monitor else "")
+    if HYPRHANDS:
+        return f"exec {shlex.quote(HYPRHANDS)}{args}"
+    return f'h="$HOME/.local/bin/hyprhands"; [ -x "$h" ] || h=hyprhands; exec "$h"{args}'
+
+
+def _refusal(message: str) -> str | None:
+    """Why hyprhands refused an input, when the refusal should end the run rather than crash it:
+    the owner took the seat back, the panic file exists, or the key is one of the owner's
+    compositor binds (sending it anyway would run the owner's shortcut)."""
+    if "refused: " in message:
+        return message.split("refused: ", 1)[1]
+    if "compositor bind" in message:
+        return message.split(": ", 1)[-1]
+    return None
+
+
 class HyprlandDesktop:
     """One ssh session to a Hyprland machine, and the observation read over it."""
 
     def __init__(self, host: str, monitor: str | None, recognize_text, *, ssh: list[str] | None = None) -> None:
         self.host = host
         self._recognize = recognize_text
-        script = base64.b64encode(REMOTE_SCRIPT.read_bytes()).decode()
-        remote_cmd = f"python3 -u -c {shlex.quote(f'import base64;exec(base64.b64decode({script!r}))')}"
         self._proc = subprocess.Popen(
-            [*(ssh or ["ssh", "-o", "BatchMode=yes"]), host, remote_cmd],
+            [*(ssh or ["ssh", "-o", "BatchMode=yes"]), host, serve_command(monitor)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            text=True,
-            bufsize=1,
         )
-        hello = self._call("hello", monitor=monitor)
+        hello = self._call("hello")
         self.monitor = hello["monitor"]
-        self.atspi = hello["atspi"]
+        self.atspi = hello["a11y"]
         self._obs: dict | None = None
 
     def __repr__(self) -> str:
@@ -98,58 +149,65 @@ class HyprlandDesktop:
 
     # ----- the wire --------------------------------------------------------------------------
 
-    def _call(self, op: str, **args) -> dict:
+    def _call_blob(self, op: str, **args) -> tuple[dict, bytes | None]:
         if self._proc.poll() is not None:
             raise RemoteError(f"the ssh session to {self.host} has ended")
-        self._proc.stdin.write(json.dumps({"op": op, **args}) + "\n")
-        self._proc.stdin.flush()
-        line = self._proc.stdout.readline()
-        if not line:
-            raise RemoteError(f"the ssh session to {self.host} closed during {op}")
-        reply = json.loads(line)
+        try:
+            write_request(self._proc.stdin, {"op": op, **args})
+            reply, blob = read_reply(self._proc.stdout)
+        except (EOFError, BrokenPipeError) as e:
+            raise RemoteError(f"the ssh session to {self.host} closed during {op} (is hyprhands installed there?)") from e
         if not reply.pop("ok"):
             raise RemoteError(f"{op}: {reply.get('error')}")
-        return reply
+        return reply, blob
+
+    def _call(self, op: str, **args) -> dict:
+        return self._call_blob(op, **args)[0]
 
     def _input(self, op: str, **args) -> dict:
         self._obs = None  # anything read before this input is stale after it
         try:
             return self._call(op, **args)
         except RemoteError as e:
-            if "owner took over" in str(e):
-                raise Abort(str(e).split("refused: ", 1)[-1]) from e
+            if (why := _refusal(str(e))) is not None:
+                raise Abort(why) from e
             raise
 
     def _now(self) -> dict:
         """The window and the tree as they are now, fetched once per observation."""
         if self._obs is None:
-            state = self._call("state")
-            tree = self._call("tree")
+            tree = self._call("tree", text=True)
+            window = self._call("state")["window"]
             root = a11y.parse(tree["xml"])
-            window = state["window"]
             name = APP_NAMES.get(window["class"], "") if window else ""
             if root is not None and name:
                 for app in root:
                     app.set("name", name)  # the name jev compares with CLICKER_BROWSER, whatever AT-SPI calls it
-            self._obs = {"window": window, "root": root, "capped": tree.get("capped", False)}
+            lines = tree.get("lines")
+            self._obs = {
+                "window": window,
+                "root": root,
+                "capped": tree.get("capped", False),
+                "lines": None if lines is None else [(l["text"], 1.0, tuple(l["box"])) for l in lines],
+            }
         return self._obs
 
     # ----- the escape hatch ------------------------------------------------------------------
 
     def check_abort(self) -> None:
         state = self._call("state")
-        if state["stop"]:
-            raise Abort(f"panic key on {self.host}")
-        if state.get("takeover"):
+        if state.get("takeover"):  # the owner at the controls, or the panic file
             raise Abort(state["takeover"])
+        if state.get("cursor") is None:
+            return
         x, y = state["cursor"]
         if 0 <= x <= ABORT_CORNER_PX and 0 <= y <= ABORT_CORNER_PX:
             raise Abort(f"mouse in the top-left corner of {self.monitor['name']}")
 
     def abort_hint(self) -> str:
         return (
-            f"take the seat on {self.host}: move the mouse, focus another monitor, or smash Escape; "
-            "or the panic key (SUPER+SHIFT+BackSpace), or Ctrl-C here"
+            f"take the seat on {self.host}: move the mouse or focus another monitor; "
+            "or touch $XDG_RUNTIME_DIR/hyprhands-stop there, or Ctrl-C here"
         )
 
     def sleep_watching(self, seconds: float) -> None:
@@ -187,15 +245,16 @@ class HyprlandDesktop:
         self.press("delete")
 
     def scroll(self, lines: int) -> None:
-        """Scroll under the pointer, parked over the active window's centre first, as the Mac adapter
-        does. jev's positive lines scroll up; hypruse's positive notches scroll down."""
+        """Scroll over the active window's centre, as the Mac adapter does. jev's positive lines
+        scroll up; hyprhands' positive notches scroll down."""
         self.check_abort()
-        bounds = self.frontmost_window_bounds()
-        if bounds is not None:
-            x, y, w, h = bounds
-            self._input("move", x=x + w / 2, y=y + h / 2)
         notches = -round(lines / SCROLL_LINES_PER_NOTCH) or (-1 if lines > 0 else 1)
-        self._input("scroll", notches=notches)
+        bounds = self.frontmost_window_bounds()
+        if bounds is None:
+            self._input("scroll", notches=notches)
+        else:
+            x, y, w, h = bounds
+            self._input("scroll", x=x + w / 2, y=y + h / 2, notches=notches)
 
     # ----- apps and windows ------------------------------------------------------------------
 
@@ -213,12 +272,13 @@ class HyprlandDesktop:
         """Bring `app` forward; the browser is started when it has no window."""
         self.check_abort()
         klass = APP_CLASSES.get(app, app)
-        found = self._call("find_window", klass=klass)["address"]
+        found = self._call("find_window", **{"class": klass})["address"]
         if found is None:
             if app not in BROWSER_ARGV:
                 return False
-            self._input("launch", argv=[*BROWSER_ARGV[app], *BROWSER_FLAGS])
-            found = self._call("find_window", klass=klass)["address"]
+            found = self._input("launch", argv=[*BROWSER_ARGV[app], *BROWSER_FLAGS])["address"]
+            if found is None:
+                found = self._call("find_window", **{"class": klass})["address"]
             if found is None:
                 return False
         self._input("bring", address=found)
@@ -236,7 +296,7 @@ class HyprlandDesktop:
         self.check_abort()
         argv = [*BROWSER_ARGV.get(browser, BROWSER_ARGV["Google Chrome"]), *BROWSER_FLAGS, url]
         klass = APP_CLASSES.get(browser, "google-chrome")
-        if self._call("find_window", klass=klass)["address"] is None:
+        if self._call("find_window", **{"class": klass})["address"] is None:
             self._input("launch", argv=argv)
         else:
             self._input("spawn", argv=argv)
@@ -257,8 +317,10 @@ class HyprlandDesktop:
 
     def screenshot(self) -> Image.Image:
         self._obs = None  # a fresh capture starts a fresh observation
-        png = base64.b64decode(self._call("screenshot")["png"])
-        return Image.open(BytesIO(png)).convert("RGB")
+        import qoi  # the `hyprland` extra; imported here so the rest of the package never needs it
+
+        _, blob = self._call_blob("screenshot")
+        return Image.fromarray(qoi.decode(blob)).convert("RGB")
 
     def display_scale(self, image: Image.Image) -> float:
         return image.width / self.monitor["width"]
@@ -269,15 +331,10 @@ class HyprlandDesktop:
     def text_lines(self, screen) -> list[OcrLine] | None:
         """The screen's text from the accessibility tree, in capture pixels, or None to read pixels.
 
-        None when the walk was cut short (text in view may be missing) or the tree holds too little
-        text to stand in for OCR.
+        hyprhands reads it beside the tree, and offers none when the walk was cut short (text in
+        view may be missing) or the tree holds too little text to stand in for OCR.
         """
-        obs = self._now()
-        if obs["root"] is None or obs["capped"]:
-            return None
-        app = a11y.active_app(obs["root"])
-        lines = tree_text.tree_lines(app, screen.scale, self.monitor["width"], self.monitor["height"])
-        return lines if len(lines) >= tree_text.MIN_LINES else None
+        return self._now()["lines"]
 
     def focused_field(self) -> Field | None:
         return a11y.focused_field(self._now()["root"])

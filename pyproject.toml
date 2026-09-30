@@ -39,6 +39,9 @@ dependencies = [
 # Portable OCR for Linux, where macOS Vision does not exist: the OSWorld benchmark reads the VM's
 # screen with it (`--ocr rapidocr`). Optional, so a Mac that stays on Vision never installs it.
 rapidocr = ["rapidocr==3.9.2", "onnxruntime==1.30.0"]
+# `clicker-hypr`, driving a Hyprland machine through hyprhands: RapidOCR for pixels, and a QOI
+# decoder for the captures hyprhands sends.
+hyprland = ["rapidocr==3.9.2", "onnxruntime==1.30.0", "qoi==0.7.2"]
 
 [project.urls]
 Homepage = "https://github.com/awlevin/typesafe-computer-use"

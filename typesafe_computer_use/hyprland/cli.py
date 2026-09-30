@@ -33,11 +33,11 @@ def main(argv: list[str] | None = None) -> None:
         recognize = ocr.backend("rapidocr")
     except (ValueError, ocr.Unavailable) as e:
         sys.exit(str(e))
-    os.environ.setdefault("CLICKER_BROWSER", "Google Chrome")
+    os.environ.setdefault("CLICKER_BROWSER", "Chromium")
     remote = HyprlandDesktop(args.host, args.monitor, recognize)
     m = remote.monitor
     print(
-        f"driving {args.host} monitor {m['name']} ({m['width']:g}x{m['height']:g} at scale {m['scale']:g}); atspi={remote.atspi}"
+        f"driving {args.host} monitor {m['name']} ({m['width']:g}x{m['height']:g} at scale {m['scale']:g}); a11y={remote.atspi}"
     )
     try:
         with using(remote):
