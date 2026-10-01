@@ -6,14 +6,13 @@
 #   jev --inspect "goal"       capture + the exact payload jev would send
 #
 # Runs from the repo so its .env loads; each run gets runs/<timestamp>/ unless --out is given.
-# Host and monitor: JEV_HYPR_HOST (mason-desktop), JEV_HYPR_MONITOR (HDMI-A-1).
+# Host: JEV_HYPR_HOST (mason-desktop). Monitor: the focused one, unless JEV_HYPR_MONITOR names one.
 # Stop a run: move the mouse or focus another monitor there, `hyprhands stop` there, or Ctrl-C here.
 # Installed by scripts/install-jev, which links this file into ~/.local/bin.
 set -euo pipefail
 REPO="${JEV_REPO:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
 cd "$REPO"
 export JEV_HYPR_HOST="${JEV_HYPR_HOST:-mason-desktop}"
-export JEV_HYPR_MONITOR="${JEV_HYPR_MONITOR:-HDMI-A-1}"
 # Writer: this box's Claude Code sign-in (`claude -p`) unless an API key or another endpoint is set.
 if [[ -z "${ANTHROPIC_API_KEY:-}" && -z "${CLICKER_WRITER_BASE_URL:-}" ]] && ! grep -qsE '^(ANTHROPIC_API_KEY|CLICKER_WRITER_BASE_URL)=.+' .env; then
   export CLICKER_WRITER_API="${CLICKER_WRITER_API:-claude-code}"
