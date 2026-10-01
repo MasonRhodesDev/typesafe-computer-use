@@ -131,6 +131,34 @@ def test_use_browser_opens_a_catalog_site_by_its_url(screen, browser, monkeypatc
     assert browser == [("open", "Google Chrome", "https://github.com/")]
 
 
+def test_use_browser_opens_the_page_the_goal_names_on_a_catalog_site(screen, browser):
+    ctx = replace(context(), goal="open github.com/MasonRhodesDev/hyprhands and show its open issues")
+    assert actions.perform(browsing("github"), screen, [], ctx) == "opened https://github.com/MasonRhodesDev/hyprhands"
+    assert browser == [("open", "Google Chrome", "https://github.com/MasonRhodesDev/hyprhands")]
+
+
+def test_use_browser_does_not_reopen_the_page_it_is_on(screen, browser):
+    there = replace(screen, url="github.com/MasonRhodesDev/hyprhands/")
+    ctx = replace(context(), goal="open https://www.github.com/MasonRhodesDev/hyprhands")
+    assert actions.perform(browsing("github"), there, [], ctx) == (
+        "activated Google Chrome, already on https://www.github.com/MasonRhodesDev/hyprhands"
+    )
+    assert browser == [("activate", "Google Chrome")]
+
+
+@pytest.mark.parametrize(
+    "goal, found",
+    [
+        ("show github.com/a/b/issues.", "https://github.com/a/b/issues"),
+        ("go to https://github.com/a and star it", "https://github.com/a"),
+        ("open github.com and find my repos", None),  # the home page: the catalog URL already is
+        ("open gitlab.com/a/b", None),  # another host
+    ],
+)
+def test_goal_url_finds_only_a_deeper_page_on_the_sites_own_host(goal, found):
+    assert actions.goal_url(goal, "https://github.com/") == found
+
+
 def test_use_browser_asks_the_writer_for_a_site_outside_the_catalog(screen, browser, monkeypatch):
     writer = object()
     asked = []

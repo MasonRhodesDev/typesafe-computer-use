@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
 from typesafe_sdk import TypeSafeClient
 
@@ -115,12 +117,45 @@ def restore_field(field: Field, typed: str) -> bool:
     return desktop.ax_set_value(ref, field.value) and desktop.ax_value(ref) == field.value
 
 
+# A host (with an optional path) written into a goal: "github.com/owner/repo", "https://x.dev/a".
+GOAL_URL = re.compile(r"(?:https?://)?((?:[a-z0-9-]+\.)+[a-z]{2,})(/[^\s,;)\"'<>]*)?", re.IGNORECASE)
+
+
+def _host(url: str) -> str:
+    """The host of a URL with or without its scheme, lowercased, without a leading www."""
+    return (urlsplit(url if "://" in url else f"https://{url}").hostname or "").removeprefix("www.")
+
+
+def goal_url(goal: str, site_url: str) -> str | None:
+    """A page the goal spells out on the catalog site's own host, deeper than its home page.
+
+    The catalog names a site by its home page; a goal like "open github.com/owner/repo" names the
+    page itself, and opening the home page instead strands the run there.
+    """
+    for m in GOAL_URL.finditer(goal):
+        path = (m.group(2) or "").rstrip(".")
+        if _host(m.group(1)) == _host(site_url) and path.strip("/"):
+            return f"https://{m.group(1)}{path}"
+    return None
+
+
+def same_page(current: str | None, url: str) -> bool:
+    """Whether the browser is already on `url` (scheme, www, a trailing slash and a fragment
+    aside): opening it again would only add a tab."""
+    if not current:
+        return False
+    norm = lambda u: (_host(u), (urlsplit(u if "://" in u else f"https://{u}").path or "/").rstrip("/"))
+    return norm(current) == norm(url)
+
+
 def _use_browser(decision: Decision, screen, items, ctx: Context) -> str:
     """Go to the browser, and open the website the site answer named.
 
     `none` is the page already open there, so bringing the browser forward is the whole action. A
-    catalog key is its URL, and `other` is a site outside the catalog, which only the writer can
-    name. Opening a URL activates the browser too, so the three cases differ only in the page.
+    catalog key is its URL (or the page on it the goal spells out), and `other` is a site outside
+    the catalog, which only the writer can name. Opening a URL activates the browser too, so the
+    three cases differ only in the page; a page the browser is already on is not opened again,
+    since each open adds a tab.
     """
     site = decision.site.choice
     if site == "none":
@@ -128,7 +163,9 @@ def _use_browser(decision: Decision, screen, items, ctx: Context) -> str:
             return f"activated {ctx.browser}"
         return f"use_browser failed: {ctx.browser} did not come to the front"
     url = SITES.get(site)
-    if url is None:
+    if url is not None:
+        url = goal_url(ctx.goal, url) or url
+    else:
         if ctx.writer is None:
             return "use_browser refused: the site is outside the catalog and no writer is available to propose a URL"
         try:
@@ -137,6 +174,10 @@ def _use_browser(decision: Decision, screen, items, ctx: Context) -> str:
             return f"use_browser refused: the writer failed ({e})"
     if not url:
         return "use_browser refused: the writer proposed no usable URL for this goal"
+    if same_page(screen.url, url):
+        if desktop.activate(ctx.browser):
+            return f"activated {ctx.browser}, already on {url}"
+        return f"use_browser failed: {ctx.browser} did not come to the front"
     if desktop.open_url(ctx.browser, url):
         return f"opened {url}"
     return f"use_browser failed: opened {url} but {ctx.browser} did not come to the front"
