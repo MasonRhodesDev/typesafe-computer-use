@@ -14,5 +14,6 @@ host="${JEV_HYPR_HOST:-mason-desktop}"
 if ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" 'command -v hyprhands >/dev/null && hyprhands doctor' ; then
   echo "hyprhands ready on $host"
 else
-  echo "hyprhands is not installed on $host: build its packaging/arch/PKGBUILD there" >&2
+  echo "hyprhands is not installed on $host: install the arch-package-<arch> artifact from" \
+    "hyprhands CI with pacman -U there (never build it on $host)" >&2
 fi
