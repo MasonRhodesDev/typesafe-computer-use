@@ -136,6 +136,8 @@ class HyprlandDesktop:
         self.monitor = hello["monitor"]
         self.atspi = hello["a11y"]
         self._obs: dict | None = None
+        self._profile_launched = False
+        self._launched: dict[str, str] = {}
 
     def __repr__(self) -> str:
         return f"<HyprlandDesktop {self.host}:{self.monitor['name']}>"
@@ -273,7 +275,8 @@ class HyprlandDesktop:
         """Bring `app` forward; the browser is started when it has no window."""
         self.check_abort()
         klass = APP_CLASSES.get(app, app)
-        found = self._call("find_window", **{"class": klass})["address"]
+        # The window jev launched, not the first of its class: that may be the owner's own browser.
+        found = self._launched.get(klass) or self._call("find_window", **{"class": klass})["address"]
         if found is None:
             if app not in BROWSER_ARGV:
                 return False
@@ -297,8 +300,14 @@ class HyprlandDesktop:
         self.check_abort()
         argv = [*BROWSER_ARGV.get(browser, BROWSER_ARGV["Google Chrome"]), *BROWSER_FLAGS, url]
         klass = APP_CLASSES.get(browser, "google-chrome")
-        if self._call("find_window", **{"class": klass})["address"] is None:
-            self._input("launch", argv=argv)
+        # A separate profile is its own browser process, and one started by `spawn` (from the ssh
+        # session, no Wayland display) dies at once; only `launch` runs it in the compositor's env.
+        separate = bool(os.environ.get("JEV_BROWSER_PROFILE")) and not self._profile_launched
+        if separate or self._call("find_window", **{"class": klass})["address"] is None:
+            self._profile_launched = True
+            launched = self._input("launch", argv=argv).get("address")
+            if launched and os.environ.get("JEV_BROWSER_PROFILE"):
+                self._launched[klass] = launched
         else:
             self._input("spawn", argv=argv)
             time.sleep(LAUNCH_SETTLE_SECONDS)

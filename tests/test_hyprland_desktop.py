@@ -150,3 +150,35 @@ def test_ocr_reads_pixels_when_the_tree_is_thin_or_the_capture_is_a_replay(monke
     assert perception.ocr_lines(screen(pid=42))[0] == read
     monkeypatch.setattr(perception.desktop, "text_lines", lambda s: [("tree", 1.0, (0, 0, 1, 1))], raising=False)
     assert perception.ocr_lines(screen(pid=None))[0] == read
+
+
+def fake_browser_desk(monkeypatch):
+    d, _ = desk([])
+    calls = []
+
+    def _input(op, **kw):
+        calls.append((op, kw.get("address")))
+        return {"address": "0x9"} if op == "launch" else {}
+
+    monkeypatch.setattr(d, "check_abort", lambda: None)
+    monkeypatch.setattr(d, "_call", lambda op, **kw: {"address": "0x1"} if op == "find_window" else {})
+    monkeypatch.setattr(d, "_input", _input)
+    monkeypatch.setattr(d, "_front_class", lambda: "chromium")
+    monkeypatch.setattr(hypr.time, "sleep", lambda s: None)
+    d._profile_launched, d._launched = False, {}
+    return d, calls
+
+
+def test_a_separate_profile_is_launched_once_and_its_own_window_is_driven(monkeypatch):
+    monkeypatch.setenv("JEV_BROWSER_PROFILE", "/tmp/jev-profile")
+    d, calls = fake_browser_desk(monkeypatch)
+    d.open_url("Chromium", "https://example.com/a")
+    d.open_url("Chromium", "https://example.com/b")
+    assert calls == [("launch", None), ("bring", "0x9"), ("spawn", None), ("bring", "0x9")]
+
+
+def test_the_owners_running_browser_gets_the_url_by_spawn(monkeypatch):
+    monkeypatch.delenv("JEV_BROWSER_PROFILE", raising=False)
+    d, calls = fake_browser_desk(monkeypatch)
+    d.open_url("Chromium", "https://example.com/a")
+    assert calls == [("spawn", None), ("bring", "0x1")]
